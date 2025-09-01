@@ -1,0 +1,4 @@
+# ml/models.yaml
+models:
+  - id: onnx-community/gemma-3-270m-it-ONNX
+    revision: 2950c41   # example commit/tag on HF; replace with any model@rev you want to test
