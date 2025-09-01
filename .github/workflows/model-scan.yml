@@ -1,0 +1,43 @@
+name: Model Scan (HF)
+on:
+  pull_request:
+    paths: [ "ml/models.yaml" ]
+  workflow_dispatch:
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read model from manifest
+        id: manifest
+        shell: bash
+        run: |
+          python - <<'PY' > /tmp/manifest.out
+          import yaml
+          with open('ml/models.yaml','r') as f:
+              m = yaml.safe_load(f)
+          print(f"id={m['models'][0]['id']}")
+          print(f"rev={m['models'][0]['revision']}")
+          PY
+          cat /tmp/manifest.out >> "$GITHUB_OUTPUT"
+
+      - name: Cache Hugging Face hub (optional)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ steps.manifest.outputs.id }}-${{ steps.manifest.outputs.rev }}
+          restore-keys: |
+            hf-${{ steps.manifest.outputs.id }}-
+
+      - name: SecuraAI Model Scan
+        uses: ranikoder/securaai-action/.github/actions/model-scan@v1
+        with:
+          target_hf: "${{ steps.manifest.outputs.id }}@${{ steps.manifest.outputs.rev }}"
+          profile: "healthcare"
+          allow_extras: "onnx"
+          private_index_url: ${{ secrets.PRIVATE_PYPI_URL }}
+          license_key: ${{ secrets.SECURAAI_LICENSE }}
+          soft_fail: "true"
