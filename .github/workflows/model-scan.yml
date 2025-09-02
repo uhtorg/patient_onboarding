@@ -13,7 +13,7 @@ env:
   DOMAIN: securaai
   REPO: securaai-pypi
   ACCOUNT_ID: 975050056599       
-  SCNR_VERSION: "1.0.3"           
+  SCNR_VERSION: "1.0.4"           
 
 jobs:
   scan:
