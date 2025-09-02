@@ -1,43 +1,67 @@
-name: Model Scan (HF)
+name: model-scan
+
 on:
   pull_request:
-    paths: [ "ml/models.yaml" ]
-  workflow_dispatch:
+
 permissions:
   contents: read
   security-events: write
+  id-token: write   # OIDC -> AWS
+
+env:
+  AWS_REGION: us-east-1
+  DOMAIN: securaai
+  REPO: securaai-pypi
+  ACCOUNT_ID: 975050056599       
+  SCNR_VERSION: "1.0.3"           
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Read model from manifest
-        id: manifest
-        shell: bash
+
+      - name: Configure AWS creds (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/github-ci-codeartifact-read
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login pip to CodeArtifact
         run: |
-          python - <<'PY' > /tmp/manifest.out
-          import yaml
-          with open('ml/models.yaml','r') as f:
-              m = yaml.safe_load(f)
-          print(f"id={m['models'][0]['id']}")
-          print(f"rev={m['models'][0]['revision']}")
+          aws codeartifact login \
+            --tool pip \
+            --domain "$DOMAIN" \
+            --domain-owner "$ACCOUNT_ID" \
+            --repository "$REPO" \
+            --region "$AWS_REGION"
+
+      - name: Install scanner
+        run: |
+          python -m pip install -U pip
+          pip install "securaai-scanner[onnx]==${SCNR_VERSION}" huggingface_hub
+
+      - name: Download demo model
+        run: |
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+            "onnx-community/gemma-3-270m-it-ONNX",
+            allow_patterns=["onnx/*"],
+            local_dir="models/gemma-onnx"
+          )
           PY
-          cat /tmp/manifest.out >> "$GITHUB_OUTPUT"
 
-      - name: Cache Hugging Face hub (optional)
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: hf-${{ steps.manifest.outputs.id }}-${{ steps.manifest.outputs.rev }}
-          restore-keys: |
-            hf-${{ steps.manifest.outputs.id }}-
+      - name: Run scan
+        run: |
+          python -m securaai_scanner.cli scan \
+            models/gemma-onnx/onnx \
+            --profile healthcare \
+            --sarif-out reports/scan.sarif \
+            --json-out reports/scan.json \
+            --ci
 
-      - name: SecuraAI Model Scan
-        uses: ranikoder/securaai-action/.github/actions/model-scan@v1
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          target_hf: "${{ steps.manifest.outputs.id }}@${{ steps.manifest.outputs.rev }}"
-          profile: "healthcare"
-          allow_extras: "onnx"
-          private_index_url: ${{ secrets.PRIVATE_PYPI_URL }}
-          license_key: ${{ secrets.SECURAAI_LICENSE }}
-          soft_fail: "true"
+          sarif_file: reports/scan.sarif
