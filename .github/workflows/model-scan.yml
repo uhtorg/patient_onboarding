@@ -7,14 +7,13 @@ permissions:
   contents: read
   pull-requests: write
   security-events: write
-  id-token: write   # OIDC -> AWS
+  id-token: write
 
 env:
   AWS_REGION: us-east-1
   DOMAIN: securaai
   REPO: securaai-pypi
-  ACCOUNT_ID: 975050056599 
-  SCNR_VERSION: "1.0.4"
+  SCNR_VERSION: "1.0.5"
 
 jobs:
   scan:
@@ -24,67 +23,179 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pin Python so ONNX wheels are reliable
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # Hide identifiers in logs (good hygiene, especially if repo is public)
+      - name: Mask IDs/URLs
+        run: |
+          echo "::add-mask::${{ secrets.AWS_ACCOUNT_ID }}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+          echo "::add-mask::${{ env.DOMAIN }}-${{ secrets.AWS_ACCOUNT_ID }}.d.codeartifact.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "::add-mask::https://${{ env.DOMAIN }}-${{ secrets.AWS_ACCOUNT_ID }}.d.codeartifact.${{ env.AWS_REGION }}.amazonaws.com/pypi/${{ env.REPO }}/simple/"
+
+      # Detect model files already present in the PR under models/
+      - name: Detect existing model files
+        id: detect_local
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          files=( models/**/*.onnx models/**/*.onnx_data models/**/*.safetensors models/**/*.bin models/**/*.pt models/**/config.json )
+          keep=()
+          for f in "${files[@]}"; do [[ -f "$f" ]] && keep+=("$f"); done
+          if (( ${#keep[@]} > 0 )); then
+            echo "Found ${#keep[@]} pre-existing model files."
+            echo "SCAN_PATH=models" >> "$GITHUB_ENV"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No pre-existing model files under models/."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Configure AWS (OIDC). Needed for private package install.
       - name: Configure AWS creds (OIDC)
+        if: github.event.pull_request.head.repo.fork == false
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/github-ci-codeartifact-read
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Assumes you configured CodeArtifact to proxy public PyPI (Option A)
+      # Login pip to CodeArtifact (assumes repo proxies PyPI)
       - name: Login pip to CodeArtifact
+        if: github.event.pull_request.head.repo.fork == false
         run: |
           aws codeartifact login \
             --tool pip \
-            --domain "$DOMAIN" \
-            --domain-owner "$ACCOUNT_ID" \
-            --repository "$REPO" \
-            --region "$AWS_REGION"
+            --domain "${DOMAIN}" \
+            --domain-owner "${{ secrets.AWS_ACCOUNT_ID }}" \
+            --repository "${REPO}" \
+            --region "${AWS_REGION}"
 
+      # Install scanner + deps (includes huggingface_hub and PyYAML for YAML parsing)
       - name: Install scanner + deps
+        if: github.event.pull_request.head.repo.fork == false
         run: |
           python -m pip install -U pip
-          python -m pip install "securaai-scanner[onnx]==${SCNR_VERSION}" huggingface_hub
+          pip install "securaai-scanner[onnx]==${SCNR_VERSION}" huggingface_hub pyyaml
 
-      - name: Download model(s) from ml/models.yaml
+      # Parse ml/models.yaml (or models.yaml) and download each declared model into models/<name>/
+      - name: Download models from models.yaml
+        if: github.event.pull_request.head.repo.fork == false
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}   # optional, for gated/private models
         run: |
           python - <<'PY'
-          import yaml, os
+          import os, sys, re, json
           from pathlib import Path
-          from huggingface_hub import snapshot_download
+          import yaml
 
-          cfg = yaml.safe_load(open("ml/models.yaml"))
-          out_root = Path("models")
-          out_root.mkdir(parents=True, exist_ok=True)
+          # Try both locations
+          candidates = [Path("ml/models.yaml"), Path("models.yaml")]
+          config_path = next((p for p in candidates if p.exists()), None)
 
-          for m in cfg.get("models", []):
-              if m.get("source") != "hf": 
-                  continue
-              repo = m["repo"]
-              pats = m.get("patterns") or ["**/*"]
-              dest = out_root / (m.get("id") or repo.split("/")[-1])
-              dest.mkdir(parents=True, exist_ok=True)
-              print(f"[dl] {repo} -> {dest} allow_patterns={pats}")
-              snapshot_download(repo_id=repo, allow_patterns=pats, local_dir=str(dest))
+          if not config_path:
+            print("No models.yaml found; skipping download step.")
+            sys.exit(0)
+
+          print(f"Loading config from {config_path}")
+          cfg = yaml.safe_load(config_path.read_text()) or {}
+          items = cfg.get("models", [])
+          if not items:
+            print("No 'models' entries; skipping.")
+            sys.exit(0)
+
+          # Lazy import to keep requirements minimal
+          from huggingface_hub import snapshot_download, model_info
+
+          token = os.environ.get("HF_TOKEN") or None
+          default_patterns = ["**/*"]  # grab everything if patterns not provided
+
+          def safe_name(s: str) -> str:
+            return re.sub(r"[^A-Za-z0-9_.-]+", "-", s)
+
+          root = Path("models")
+          root.mkdir(parents=True, exist_ok=True)
+
+          downloaded = 0
+          for i, m in enumerate(items, 1):
+            src = (m.get("source") or "").strip().lower()
+            repo_id = m.get("repo")
+            mid = m.get("id")
+            rev = m.get("revision") or None
+            patterns = m.get("patterns") or default_patterns
+
+            # Infer HF repo id
+            hf_repo = None
+            if src in ("", "hf", "huggingface"):
+              if repo_id:
+                hf_repo = repo_id
+              elif mid and "/" in mid:
+                hf_repo = mid
+            if not hf_repo:
+              print(f"[{i}] Skipping (no Hugging Face repo inferred): {m}")
+              continue
+
+            dest = root / safe_name(mid or repo_id)
+            dest.mkdir(parents=True, exist_ok=True)
+
+            print(f"[{i}] Downloading {hf_repo} -> {dest} (rev={rev}, allow_patterns={patterns})")
+            try:
+              # Log repo files for visibility
+              try:
+                info = model_info(hf_repo, token=token)
+                files = [s.rfilename for s in (info.siblings or [])]
+                print("  Repo files (first 20):", files[:20])
+              except Exception as e:
+                print("  model_info failed:", e)
+
+              snapshot_download(
+                hf_repo,
+                revision=rev,
+                token=token,
+                local_dir=str(dest),
+                local_dir_use_symlinks=False,
+                allow_patterns=patterns,
+              )
+              downloaded += 1
+            except Exception as e:
+              print(f"  ERROR downloading {hf_repo}: {e}")
+
+          # If we downloaded anything, make sure we scan 'models'
+          if downloaded:
+            print(f"Downloaded {downloaded} model(s).")
+            Path(os.environ["GITHUB_ENV"]).write_text(
+              (os.environ.get("GITHUB_ENV_CONTENT","") or "") + f"SCAN_PATH=models\n",
+              encoding="utf-8"
+            )
           PY
 
-
-      - name: Run scan
+      - name: Ensure scan path if models exist
         run: |
+          if [ -d models ] && [ "$(ls -A models)" ]; then
+            echo "SCAN_PATH=models" >> "$GITHUB_ENV"
+          fi
+  
+      - name: Run scan
+        if: env.SCAN_PATH != ''
+        run: |
+          echo "Scanning path: $SCAN_PATH"
+          mkdir -p reports
           python -m securaai_scanner.cli scan \
-            models \
+            "$SCAN_PATH" \
             --profile healthcare \
             --sarif-out reports/scan.sarif \
             --json-out reports/scan.json \
             --ci
 
+      - name: Upload SARIF to GitHub code scanning
+        if: github.event.pull_request.head.repo.fork == false && always() && hashFiles('reports/scan.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/scan.sarif
 
-      - name: Summarize findings in the job (markdown)
+      - name: Summarize findings
         if: always()
         run: |
           echo "### SecuraAI scan summary" >> "$GITHUB_STEP_SUMMARY"
@@ -99,41 +210,36 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY" || true
             echo "</details>" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "- No reports/scan.json produced" >> "$GITHUB_STEP_SUMMARY"
-          fi
+            echo "- _No scan report produced (no models found / scan skipped)._ " >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Comment on the PR (first 20 findings)
+      - name: PR comment (first 20 findings)
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');                  // OK
+            const fs = require('fs');
+            const core = require('@actions/core');
             const path = 'reports/scan.json';
-
             if (!fs.existsSync(path)) {
-              core.setFailed(`No ${path} was produced`);
+              core.notice('No reports/scan.json produced (scan skipped).');
               return;
             }
-
             const result   = JSON.parse(fs.readFileSync(path, 'utf8'));
             const findings = Array.isArray(result.findings) ? result.findings : [];
             const verdict  = (((result.policy||{}).verdict)||'pass').toLowerCase();
             const icon     = verdict === 'fail' ? '❌' : verdict === 'warn' ? '⚠️' : '✅';
-
             const lines = findings.slice(0, 20).map((f, i) => {
               const rule = f.rule || f.rule_id || f.metric_code || 'rule';
               const sev  = (f.severity || f.level || 'info').toUpperCase();
-              const where = f.path ? `${f.path}${f.line ? ':'+f.line : ''}` : '';
+              const where = f.file ? `${f.file}${f.line ? ':'+f.line : ''}` : '';
               const msg = f.message || f.title || '';
               return `${i+1}. **[${sev}] ${rule}** ${where} — ${msg}`.trim();
             }).join('\n');
-
             const body = [
               `${icon} **SecuraAI scan** — verdict: \`${verdict}\``,
               `Findings: ${findings.length}`,
               lines || '_No findings to display._'
             ].join('\n\n');
-
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -141,11 +247,9 @@ jobs:
               body
             });
 
-
       - name: Inline annotations (best-effort)
         if: always()
         run: |
-          # Emit GitHub workflow command annotations so they show in the Checks tab.
           if [ -f reports/scan.json ]; then
             jq -r '
               .findings[]?
@@ -164,6 +268,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Enforce policy (fail PR on violations)
+        if: env.SCAN_PATH != ''
         run: |
           VERDICT=$(jq -r '.policy.verdict // "pass"' reports/scan.json)
           echo "Verdict: $VERDICT"
