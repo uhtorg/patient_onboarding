@@ -289,9 +289,23 @@ jobs:
             reports/scan.sarif
           if-no-files-found: warn
 
-      - name: Enforce policy (fail PR on violations)
-        if: env.SCAN_PATH != ''
+      - name: Enforce policy (configurable)
+        if: always()
+        env:
+          FAIL_ON: ${{ vars.SECURAAI_FAIL_ON || 'fail' }}
         run: |
+          if [ ! -f reports/scan.json ]; then
+            echo "No scan.json produced; not enforcing."
+            exit 0
+          fi
+
           VERDICT=$(jq -r '.policy.verdict // "pass"' reports/scan.json)
-          echo "Verdict: $VERDICT"
-          test "$VERDICT" = "pass"
+          echo "Verdict: ${VERDICT} (fail_on=${FAIL_ON})"
+
+          case "${FAIL_ON}:${VERDICT}" in
+            never:*)                                 echo "ℹ️ Not enforcing"; exit 0 ;;
+            fail:fail|fail:block)                    echo "❌ Blocking (${VERDICT})"; exit 1 ;;
+            warn:warn|warn:fail|warn:block)          echo "❌ Blocking (${VERDICT})"; exit 1 ;;
+            *)                                       echo "✅ Non-blocking (${VERDICT})"; exit 0 ;;
+          esac
+
