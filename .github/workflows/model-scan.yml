@@ -222,26 +222,46 @@ jobs:
           script: |
             const fs = require('fs');
             const path = 'reports/scan.json';
+
+            // Use the injected 'core' from github-script; do NOT redeclare it.
+            const hasCore = (typeof core !== 'undefined');
+
             if (!fs.existsSync(path)) {
-              core.notice('No reports/scan.json produced (scan skipped).');
+              (hasCore ? core.notice : console.log)(`No ${path} produced (scan skipped).`);
               return;
             }
-            const result   = JSON.parse(fs.readFileSync(path, 'utf8'));
+
+            let result;
+            try {
+              result = JSON.parse(fs.readFileSync(path, 'utf8'));
+            } catch (e) {
+              (hasCore ? core.warning : console.warn)(`Could not parse ${path}: ${e.message}`);
+              return;
+            }
+
             const findings = Array.isArray(result.findings) ? result.findings : [];
-            const verdict  = (((result.policy||{}).verdict)||'pass').toLowerCase();
+            const verdict  = String((((result.policy || {}).verdict) || 'pass')).toLowerCase();
             const icon     = verdict === 'fail' ? '❌' : verdict === 'warn' ? '⚠️' : '✅';
+
+            const toStr = (v) => (v == null ? '' : String(v));
+            const toUpper = (v, d='INFO') => toStr(v || d).toUpperCase();
+
             const lines = findings.slice(0, 20).map((f, i) => {
-              const rule = f.rule || f.rule_id || f.metric_code || 'rule';
-              const sev  = (f.severity || f.level || 'info').toUpperCase();
-              const where = f.file ? `${f.file}${f.line ? ':'+f.line : ''}` : '';
-              const msg = f.message || f.title || '';
+              const rule  = toStr(f.rule || f.rule_id || f.metric_code || 'rule');
+              const sev   = toUpper(f.severity ?? f.level, 'info');
+              const file  = toStr(f.file || f.path || 'model');
+              const line  = (f.line || f.startLine || f.start_line || 1);
+              const msg   = toStr(f.message || f.title || '');
+              const where = file ? `${file}:${line}` : '';
               return `${i+1}. **[${sev}] ${rule}** ${where} — ${msg}`.trim();
             }).join('\n');
+
             const body = [
               `${icon} **SecuraAI scan** — verdict: \`${verdict}\``,
               `Findings: ${findings.length}`,
               lines || '_No findings to display._'
             ].join('\n\n');
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
