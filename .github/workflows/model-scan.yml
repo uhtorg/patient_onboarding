@@ -198,19 +198,21 @@ jobs:
       - name: Summarize findings
         if: always()
         run: |
-          echo "### SecuraAI scan summary" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f reports/scan.json ]; then
-            VERDICT=$(jq -r '.policy.verdict // "pass"' reports/scan.json)
-            COUNT=$(jq -r '.findings | length' reports/scan.json)
-            echo "- **Verdict:** $VERDICT" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Findings:** $COUNT" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "<details><summary>Top findings</summary>" >> "$GITHUB_STEP_SUMMARY"
-            jq -r '.findings[:20][] | "- [\(.rule)] \(.message) (\(.file // "n/a"))"' reports/scan.json \
-              >> "$GITHUB_STEP_SUMMARY" || true
-            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- _No scan report produced (no models found / scan skipped)._ " >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### SecuraAI scan summary"
+            if [ -f reports/scan.json ]; then
+              VERDICT=$(jq -r '.policy.verdict // "pass"' reports/scan.json)
+              COUNT=$(jq -r '.findings | length' reports/scan.json)
+              echo "- **Verdict:** ${VERDICT}"
+              echo "- **Findings:** ${COUNT}"
+              echo
+              echo "<details><summary>Top findings</summary>"
+              jq -r '.findings[:20][] | "- [\(.rule // \"rule\")] \(.message // \"\") (\(.file // \"n/a\"))"' reports/scan.json || true
+              echo "</details>"
+            else
+              echo "- _No scan report produced (no models found / scan failed before report)._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: PR comment (first 20 findings)
         if: github.event_name == 'pull_request'
