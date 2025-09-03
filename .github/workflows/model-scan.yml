@@ -213,6 +213,7 @@ jobs:
               echo "- _No scan report produced (no models found / scan failed before report)._"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+      
 
       - name: PR comment (first 20 findings)
         if: github.event_name == 'pull_request'
@@ -220,7 +221,6 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const core = require('@actions/core');
             const path = 'reports/scan.json';
             if (!fs.existsSync(path)) {
               core.notice('No reports/scan.json produced (scan skipped).');
