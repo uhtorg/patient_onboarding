@@ -1,4 +1,19 @@
-# ml/models.yaml
+# ml/models.yaml  (or models.yaml at repo root)
 models:
-  - id: onnx-community/gemma-3-270m-it-ONNX
-    revision: 2950c41   # example commit/tag on HF; replace with any model@rev you want to test
+  - id: onnx-community/gemma-3-270m-it-ONNX     # HF repo id
+    revision: 2950c41                           # optional: pin HF commit/tag
+    patterns:                                   # optional allow-list (HF)
+      - "onnx/**"
+      - "**/*.onnx"
+      - "**/*.onnx_data"
+
+  - id: tinyvlm                                 # local alias (used for folder name)
+    source: hf                                  # ‘hf’ = Hugging Face
+    repo: anananan116/TinyVLM                   # HF repo id
+    revision: null                              # optional
+    patterns:                                   # optional allow-list (HF)
+      - "**/*.onnx"
+      - "**/*.pt"
+      - "**/*.bin"
+      - "**/*.safetensors"
+      - "**/config.json"
