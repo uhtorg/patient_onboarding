@@ -13,7 +13,7 @@ env:
   AWS_REGION: us-east-1
   DOMAIN: securaai
   REPO: securaai-pypi
-  SCNR_VERSION: "1.0.8"
+  SCNR_VERSION: "1.0.9"
 
 jobs:
   scan:
